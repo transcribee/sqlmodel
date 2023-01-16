@@ -1,5 +1,6 @@
 import ipaddress
 import uuid
+import warnings
 import weakref
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
@@ -11,7 +12,7 @@ from typing import (
     Callable,
     ClassVar,
     Dict,
-    List,
+    Hashable,
     Mapping,
     Optional,
     Sequence,
@@ -34,16 +35,52 @@ from pydantic.utils import ROOT_KEY, Representation
 from sqlalchemy import Boolean, Column, Date, DateTime
 from sqlalchemy import Enum as sa_Enum
 from sqlalchemy import Float, ForeignKey, Integer, Interval, Numeric, inspect
-from sqlalchemy.orm import RelationshipProperty, declared_attr, registry, relationship
+from sqlalchemy.orm import relationship
 from sqlalchemy.orm.attributes import set_attribute
-from sqlalchemy.orm.decl_api import DeclarativeMeta
+from sqlalchemy.orm.decl_api import DeclarativeMeta, declared_attr, registry
 from sqlalchemy.orm.instrumentation import is_instrumented
+from sqlalchemy.orm.query import Query
+from sqlalchemy.orm.relationships import RelationshipProperty
+from sqlalchemy.sql.elements import ColumnElement
 from sqlalchemy.sql.schema import MetaData
 from sqlalchemy.sql.sqltypes import LargeBinary, Time
+from typing_extensions import Literal  # `typing.Literal` in Python 3.8+
 
 from .sql.sqltypes import GUID, AutoString
 
 _T = TypeVar("_T")
+
+# From SQLAlchemy stubs for `RelationshipProperty`:
+_OrderByArgument = Union[
+    Literal[False],  # default
+    str,
+    ColumnElement[Any],
+    Sequence[ColumnElement[Any]],
+    Callable[
+        [],
+        Union[
+            ColumnElement[Any],
+            Sequence[ColumnElement[Any]],
+        ],
+    ],
+]
+# From SQLAlchemy documentation for `RelationshipProperty.lazy`:
+# (https://docs.sqlalchemy.org/en/14/orm/relationship_api.html#sqlalchemy.orm.relationship.params.lazy)
+_LazyArgument = Union[
+    Literal[
+        "select",  # default
+        "immediate",
+        "joined",
+        "subquery",
+        "selectin",
+        "noload",
+        "raise",
+        "raise_on_sql",
+        "dynamic",
+    ],
+    bool,
+    None,
+]
 
 
 def __dataclass_transform__(
@@ -89,31 +126,155 @@ class FieldInfo(PydanticFieldInfo):
 
 
 class RelationshipInfo(Representation):
-    def __init__(
-        self,
-        *,
-        back_populates: Optional[str] = None,
-        link_model: Optional[Any] = None,
-        sa_relationship: Optional[RelationshipProperty] = None,  # type: ignore
-        sa_relationship_args: Optional[Sequence[Any]] = None,
-        sa_relationship_kwargs: Optional[Mapping[str, Any]] = None,
-    ) -> None:
-        if sa_relationship is not None:
-            if sa_relationship_args is not None:
+    # Set slots corresponding to parameters for the SQLAlchemy
+    # [relationship](https://docs.sqlalchemy.org/en/14/orm/relationship_api.html#sqlalchemy.orm.relationship),
+    # along with any custom additions, but leave out parameters
+    # that are deprecated, considered legacy, or have been replaced:
+    __slots__ = (
+        # "argument",  # replaced by the annotation
+        "secondary",
+        "primaryjoin",
+        "secondaryjoin",
+        "foreign_keys",
+        "uselist",
+        "order_by",
+        # "backref",  # legacy
+        "back_populates",
+        "overlaps",
+        "post_update",
+        "cascade",
+        "viewonly",
+        "lazy",
+        "collection_class",
+        "passive_deletes",
+        "passive_updates",
+        "remote_side",
+        "enable_typechecks",  # NOTE: not documented
+        "join_depth",
+        "comparator_factory",
+        "single_parent",
+        "innerjoin",
+        "distinct_target_key",
+        "doc",
+        "active_history",
+        # "cascade_backrefs",  # deprecated
+        "load_on_pending",
+        # "bake_queries",  # legacy
+        "_local_remote_pairs",  # NOTE: not documented
+        "query_class",
+        "info",
+        "omit_join",
+        "sync_backref",
+        # Custom:
+        "link_model",
+        # For backwards compatibility: (!?)
+        "sa_relationship",
+        "sa_relationship_args",
+        "sa_relationship_kwargs",
+    )
+
+    # Defined here for static type checkers and clarity:
+    secondary: Any
+    primaryjoin: Any
+    secondaryjoin: Any
+    foreign_keys: Any
+    uselist: Optional[bool]
+    order_by: _OrderByArgument
+    back_populates: Optional[str]
+    overlaps: Union[AbstractSet[str], str, None]
+    post_update: bool
+    cascade: Union[Literal[False], Sequence[str]]
+    viewonly: bool
+    lazy: _LazyArgument
+    collection_class: Optional[Callable[[], Any]]
+    passive_deletes: Union[bool, Literal["all"]]
+    passive_updates: bool
+    remote_side: Any
+    enable_typechecks: bool  # NOTE: not documented
+    join_depth: Optional[int]
+    comparator_factory: Optional[RelationshipProperty.Comparator]
+    single_parent: bool
+    innerjoin: Union[bool, Literal["nested", "unnested"]]
+    distinct_target_key: Optional[bool]
+    doc: Optional[str]
+    active_history: bool
+    load_on_pending: bool
+    _local_remote_pairs: Any  # NOTE: not documented
+    query_class: Optional[Query]  # type: ignore[type-arg]
+    info: Optional[Mapping[Hashable, Any]]
+    omit_join: Optional[Literal[False]]
+    sync_backref: Optional[bool]
+
+    link_model: Any
+
+    sa_relationship: Optional[RelationshipProperty]  # type: ignore[type-arg]
+    sa_relationship_args: Sequence[Any]
+    sa_relationship_kwargs: Mapping[str, Any]
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__()
+        for name in self.__slots__:
+            if name in kwargs:
+                setattr(self, name, kwargs[name])
+
+    def get_relationship_kwargs(self) -> Dict[str, Any]:
+        special = {
+            "link_model",
+            "sa_relationship",
+            "sa_relationship_args",
+            "sa_relationship_kwargs",
+        }
+        kwargs = {}
+        for key in self.__slots__:
+            if key in special:
+                continue
+            value = getattr(self, key, Undefined)
+            if value is not Undefined:
+                kwargs[key] = value
+        return kwargs
+
+    def construct_relationship(self, name: str, annotation: Any) -> RelationshipProperty:  # type: ignore[type-arg]
+        """
+        Returns a corresponding SQLAlchemy `RelationshipProperty` instance.
+
+        Requires the `name` and `annotation` of the model class' attribute
+        that this relationship is assigned to.
+
+        Calls the `sqlalchemy.orm.relationship` constructor.
+        The first argument (named `argument` in SQLAlchemy) is passed the
+        model referenced by the `annotation` for this relationship attribute.
+        """
+        if self.sa_relationship is not None:
+            # The `sa_relationship` argument trumps everything: (for backwards compatibility)
+            return self.sa_relationship
+        # Get the "to"-model from the annotation:
+        temp_field = ModelField.infer(
+            name=name,
+            value=self,
+            annotation=annotation,
+            class_validators=None,
+            config=BaseConfig,
+        )
+        relationship_to = temp_field.type_
+        if isinstance(temp_field.type_, ForwardRef):
+            relationship_to = temp_field.type_.__forward_arg__
+        # Take `sa_relationship_args`: (for backwards compatibility)
+        args = list(self.sa_relationship_args)
+        kwargs = self.get_relationship_kwargs()
+        # Derive `secondary`, unless already explicitly set:
+        if self.link_model is not None:
+            if self.secondary is not None:
+                raise RuntimeError("Cannot use `link_model` and `secondary` together")
+            ins = inspect(self.link_model)
+            local_table = getattr(ins, "local_table")
+            if local_table is None:
                 raise RuntimeError(
-                    "Passing sa_relationship_args is not supported when "
-                    "also passing a sa_relationship"
+                    f"Couldn't find the secondary table for  model {self.link_model}"
                 )
-            if sa_relationship_kwargs is not None:
-                raise RuntimeError(
-                    "Passing sa_relationship_kwargs is not supported when "
-                    "also passing a sa_relationship"
-                )
-        self.back_populates = back_populates
-        self.link_model = link_model
-        self.sa_relationship = sa_relationship
-        self.sa_relationship_args = sa_relationship_args
-        self.sa_relationship_kwargs = sa_relationship_kwargs
+            kwargs["secondary"] = local_table
+        # Finally, let the `sa_relationship_kwargs` take precedence: (for backwards compatibility)
+        kwargs.update(self.sa_relationship_kwargs)
+        return relationship(relationship_to, *args, **kwargs)
 
 
 def Field(
@@ -188,20 +349,108 @@ def Field(
 
 def Relationship(
     *,
+    secondary: Any = None,
+    primaryjoin: Any = None,
+    secondaryjoin: Any = None,
+    foreign_keys: Any = None,
+    uselist: Optional[bool] = None,
+    order_by: _OrderByArgument = False,
     back_populates: Optional[str] = None,
-    link_model: Optional[Any] = None,
-    sa_relationship: Optional[RelationshipProperty] = None,  # type: ignore
-    sa_relationship_args: Optional[Sequence[Any]] = None,
+    overlaps: Union[AbstractSet[str], str, None] = None,
+    post_update: bool = False,
+    cascade: Union[Literal[False], Sequence[str]] = False,
+    viewonly: bool = False,
+    lazy: _LazyArgument = "select",
+    collection_class: Optional[Callable[[], Any]] = None,
+    passive_deletes: Union[bool, Literal["all"]] = False,
+    passive_updates: bool = True,
+    remote_side: Any = None,
+    enable_typechecks: bool = True,  # NOTE: not documented
+    join_depth: Optional[int] = None,
+    comparator_factory: Optional[RelationshipProperty.Comparator] = None,
+    single_parent: bool = False,
+    innerjoin: Union[bool, Literal["nested", "unnested"]] = False,
+    distinct_target_key: Optional[bool] = None,
+    doc: Optional[str] = None,
+    active_history: bool = False,
+    load_on_pending: bool = False,
+    _local_remote_pairs: Any = None,  # NOTE: not documented
+    query_class: Optional[Query] = None,  # type: ignore[type-arg]
+    info: Optional[Mapping[Hashable, Any]] = None,
+    omit_join: Optional[Literal[False]] = None,
+    sync_backref: Optional[bool] = None,
+    link_model: Any = None,
+    sa_relationship: Optional[RelationshipProperty] = None,  # type: ignore[type-arg]
+    sa_relationship_args: Sequence[Any] = (),
     sa_relationship_kwargs: Optional[Mapping[str, Any]] = None,
-) -> Any:
-    relationship_info = RelationshipInfo(
+) -> RelationshipInfo:
+    """
+    Constructor for explicitly defining the attributes of a model relationship.
+
+    The parameters are mostly the same as those for the constructor of the SQLAlchemy
+    [`relationship`](https://docs.sqlalchemy.org/en/14/orm/relationship_api.html#sqlalchemy.orm.relationship).
+
+    A new custom parameter is `link_model`. When designing a Many-to-Many relationship with an intermediary table,
+    the `link_model` parameter can be passed a `SQLModel` subclass, from which the `secondary` parameter is derived.
+    Therefore you cannot use `link_model` and `secondary` together.
+
+    A few `relationship` parameters have been omitted here.
+    The very first SQLAlchemy `relationship` parameter named `argument` is **not** available because it is instead
+    derived from the annotation of the relationship attribute.
+    Legacy/deprecated parameters like `backref`, `cascade_backrefs`, and `bake_queries` are also not available.
+    """
+    # For backwards compatibility: (!?)
+    if sa_relationship is not None:
+        warnings.warn(
+            "Specifying `sa_relationship` overrides all other relationship arguments",
+            DeprecationWarning,
+        )
+    if sa_relationship_args != ():
+        warnings.warn(
+            "Instead of `sa_relationship_args` use positional arguments",
+            DeprecationWarning,
+        )
+    if sa_relationship_kwargs is not None:
+        warnings.warn(
+            "`sa_relationship_kwargs` takes precedence over other keyword-arguments",
+            DeprecationWarning,
+        )
+    return RelationshipInfo(
+        secondary=secondary,
+        primaryjoin=primaryjoin,
+        secondaryjoin=secondaryjoin,
+        foreign_keys=foreign_keys,
+        uselist=uselist,
+        order_by=order_by,
         back_populates=back_populates,
+        overlaps=overlaps,
+        post_update=post_update,
+        cascade=cascade,
+        viewonly=viewonly,
+        lazy=lazy,
+        collection_class=collection_class,
+        passive_deletes=passive_deletes,
+        passive_updates=passive_updates,
+        remote_side=remote_side,
+        enable_typechecks=enable_typechecks,
+        join_depth=join_depth,
+        comparator_factory=comparator_factory,
+        single_parent=single_parent,
+        innerjoin=innerjoin,
+        distinct_target_key=distinct_target_key,
+        doc=doc,
+        active_history=active_history,
+        load_on_pending=load_on_pending,
+        _local_remote_pairs=_local_remote_pairs,
+        query_class=query_class,
+        info=info,
+        omit_join=omit_join,
+        sync_backref=sync_backref,
         link_model=link_model,
         sa_relationship=sa_relationship,
         sa_relationship_args=sa_relationship_args,
-        sa_relationship_kwargs=sa_relationship_kwargs,
+        sa_relationship_kwargs=sa_relationship_kwargs or {},
     )
-    return relationship_info
 
 
 @__dataclass_transform__(kw_only_default=True, field_descriptors=(Field, FieldInfo))
@@ -328,44 +577,10 @@ class SQLModelMetaclass(ModelMetaclass, DeclarativeMeta):
             for field_name, field_value in cls.__fields__.items():
                 dict_used[field_name] = get_column_from_field(field_value)
             for rel_name, rel_info in cls.__sqlmodel_relationships__.items():
-                if rel_info.sa_relationship:
-                    # There's a SQLAlchemy relationship declared, that takes precedence
-                    # over anything else, use that and continue with the next attribute
-                    dict_used[rel_name] = rel_info.sa_relationship
-                    continue
-                ann = cls.__annotations__[rel_name]
-                temp_field = ModelField.infer(
-                    name=rel_name,
-                    value=rel_info,
-                    annotation=ann,
-                    class_validators=None,
-                    config=BaseConfig,
-                )
-                relationship_to = temp_field.type_
-                if isinstance(temp_field.type_, ForwardRef):
-                    relationship_to = temp_field.type_.__forward_arg__
-                rel_kwargs: Dict[str, Any] = {}
-                if rel_info.back_populates:
-                    rel_kwargs["back_populates"] = rel_info.back_populates
-                if rel_info.link_model:
-                    ins = inspect(rel_info.link_model)
-                    local_table = getattr(ins, "local_table")
-                    if local_table is None:
-                        raise RuntimeError(
-                            "Couldn't find the secondary table for "
-                            f"model {rel_info.link_model}"
-                        )
-                    rel_kwargs["secondary"] = local_table
-                rel_args: List[Any] = []
-                if rel_info.sa_relationship_args:
-                    rel_args.extend(rel_info.sa_relationship_args)
-                if rel_info.sa_relationship_kwargs:
-                    rel_kwargs.update(rel_info.sa_relationship_kwargs)
-                rel_value: RelationshipProperty = relationship(  # type: ignore
-                    relationship_to, *rel_args, **rel_kwargs
-                )
+                annotation = cls.__annotations__[rel_name]
+                rel_value = rel_info.construct_relationship(rel_name, annotation)
                 dict_used[rel_name] = rel_value
-                setattr(cls, rel_name, rel_value)  # Fix #315
+                setattr(cls, rel_name, rel_value)
             DeclarativeMeta.__init__(cls, classname, bases, dict_used, **kw)
         else:
             ModelMetaclass.__init__(cls, classname, bases, dict_, **kw)
